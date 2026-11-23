@@ -1,0 +1,475 @@
+import os
+BASE = '/content/proyek'
+os.makedirs(f'{BASE}/dataset', exist_ok=True)
+os.makedirs(f'{BASE}/models', exist_ok=True)
+os.chdir(BASE)
+print('Folder kerja:', os.getcwd())
+!pip install -q streamlit
+(Untuk instalasi streamlit)
+
+
+import shutil, urllib.request
+import pandas as pd
+
+NAMA = 'kasus08_infert.csv'
+TUJUAN = f'{BASE}/dataset/{NAMA}'
+lokasi = [f'/content/{NAMA}', f'/content/drive/MyDrive/{NAMA}', f'{BASE}/{NAMA}']
+ada = next((p for p in lokasi if os.path.exists(p)), None)
+
+if ada:
+    shutil.copy(ada, TUJUAN); print('Dataset ditemukan di:', ada)
+else:
+    ok = False
+    for repo in ['Artificial-Intelegent-Course-Bank', 'ArtificialIntelegent-Course-Bank']:
+        url = f'https://raw.githubusercontent.com/Muhammad-Ikhwan-Fathulloh/{repo}/main/UTS/dataset/{NAMA}'
+        try:
+            urllib.request.urlretrieve(url, TUJUAN); print('Diunduh dari', url); ok = True; break
+        except Exception as e:
+            print('Gagal:', url, e)
+    if not ok:
+        from google.colab import files
+        print('Pilih file kasus08_infert.csv:')
+        for n in files.upload(): shutil.move(n, TUJUAN)
+
+df = pd.read_csv(TUJUAN)
+assert df.shape == (248, 8), f'Bentuk data tidak sesuai: {df.shape}'
+print('Dataset OK:', df.shape)
+dan itu hasilnya yang di bawah
+(iunduh dari https://raw.githubusercontent.com/Muhammad-Ikhwan-Fathulloh/Artificial-Intelegent-Course-Bank/main/UTS/dataset/kasus08_infert.csv
+Dataset OK: (248, 8))
+
+
+
+%%writefile latih.py
+"""Pelatihan, evaluasi, dan penyimpanan model Kasus 8."""
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (average_precision_score, confusion_matrix, f1_score,
+                             precision_score, recall_score, roc_auc_score,
+                             accuracy_score, balanced_accuracy_score)
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
+
+from fitur import (FITUR_BINER, FITUR_NUMERIK, KOLOM_BUANG, KOLOM_MENTAH,
+                   URUTAN_EDUCATION, tambah_fitur)
+
+SEED = 42
+BASE = Path(__file__).resolve().parent
+DATA = BASE / "dataset" / "kasus08_infert.csv"
+OUT = BASE / "models" / "infert_model.joblib"
+
+
+def audit(df):
+    return {
+        "jumlah_baris": int(len(df)),
+        "missing_total": int(df.isna().sum().sum()),
+        "duplikat_semua_kolom": int(df.duplicated().sum()),
+        "duplikat_tanpa_stratum": int(df.drop(columns=["stratum", "pooled.stratum"]).duplicated().sum()),
+        "proporsi_kasus": float(df["case"].mean()),
+        "nilai_negatif": int((df.select_dtypes("number") < 0).sum().sum()),
+    }
+
+
+def buat_pipeline(model):
+    prep = ColumnTransformer([("num", StandardScaler(), FITUR_NUMERIK),
+                              ("bin", "passthrough", FITUR_BINER)])
+    return Pipeline([("fitur", FunctionTransformer(tambah_fitur)),
+                     ("prep", prep), ("model", model)])
+
+
+def hitung_metrik(y_true, proba, ambang=0.5):
+    pred = (proba >= ambang).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred).ravel()
+    return {
+        "roc_auc": roc_auc_score(y_true, proba),
+        "pr_auc": average_precision_score(y_true, proba),
+        "accuracy": accuracy_score(y_true, pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, pred),
+        "precision": precision_score(y_true, pred, zero_division=0),
+        "recall": recall_score(y_true, pred),
+        "f1": f1_score(y_true, pred),
+        "confusion_matrix": [[int(tn), int(fp)], [int(fn), int(tp)]],
+        "ambang": ambang,
+    }
+
+
+def main():
+    df = pd.read_csv(DATA)
+    info_audit = audit(df)
+    print("Audit:", info_audit)
+
+    y = df["case"]
+    groups = df["stratum"]                      # hanya untuk split/CV, bukan fitur
+    X = df.drop(columns=KOLOM_BUANG)[KOLOM_MENTAH]
+
+    # 1) SPLIT dulu (per stratum), sebelum scaling/encoding apa pun
+    idx_tr, idx_te = next(GroupShuffleSplit(n_splits=1, test_size=0.2,
+                                            random_state=SEED).split(X, y, groups))
+    X_tr, X_te = X.iloc[idx_tr], X.iloc[idx_te]
+    y_tr, y_te = y.iloc[idx_tr], y.iloc[idx_te]
+    g_tr = groups.iloc[idx_tr]
+    print(f"Train={len(X_tr)} (kasus {y_tr.mean():.2%}) | Test={len(X_te)} (kasus {y_te.mean():.2%})")
+
+    kandidat = {
+        "Logistic Regression": LogisticRegression(class_weight="balanced", max_iter=1000,
+                                                  random_state=SEED),
+        "Random Forest": RandomForestClassifier(n_estimators=300, max_depth=4, min_samples_leaf=5,
+                                                class_weight="balanced_subsample",
+                                                random_state=SEED, n_jobs=-1),
+    }
+
+    # 2) Pemilihan model: CV di data train saja
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
+    skor = ["roc_auc", "average_precision", "f1", "recall", "precision"]
+    baris = []
+    for nama, model in kandidat.items():
+        hasil = cross_validate(buat_pipeline(model), X_tr, y_tr, groups=g_tr,
+                               cv=cv, scoring=skor, n_jobs=1)
+        baris.append({"model": nama, **{s: float(np.mean(hasil[f"test_{s}"])) for s in skor},
+                      "roc_auc_std": float(np.std(hasil["test_roc_auc"]))})
+    tabel_cv = pd.DataFrame(baris).sort_values("roc_auc", ascending=False).reset_index(drop=True)
+    print("\nHasil CV (data train):\n", tabel_cv.round(3).to_string(index=False))
+
+    terbaik = tabel_cv.loc[0, "model"]
+    print("\nModel terpilih:", terbaik)
+
+    # 3) Fit ke seluruh train, evaluasi di test SATU kali
+    pipe = buat_pipeline(kandidat[terbaik]).fit(X_tr, y_tr)
+    proba_te = pipe.predict_proba(X_te)[:, 1]
+    metrik_test = hitung_metrik(y_te.to_numpy(), proba_te)
+    print("\nMetrik test:", {k: (round(v, 3) if isinstance(v, float) else v)
+                              for k, v in metrik_test.items()})
+
+    # 4) Simpan pipeline + metadata
+    OUT.parent.mkdir(exist_ok=True)
+    mdl = pipe.named_steps["model"]
+    joblib.dump({
+        "pipeline": pipe,
+        "model_terpilih": terbaik,
+        "kolom_input": KOLOM_MENTAH,
+        "opsi_education": URUTAN_EDUCATION,
+        "kelas": {0: "Kontrol", 1: "Kasus"},
+        "metrik_test": metrik_test,
+        "tabel_cv": tabel_cv.to_dict("records"),
+        "audit": info_audit,
+        "rentang": {c: [int(X[c].min()), int(X[c].max())]
+                    for c in ["age", "parity", "induced", "spontaneous"]},
+        "ukuran": {"train": int(len(X_tr)), "test": int(len(X_te))},
+        "y_test": y_te.tolist(),
+        "proba_test": [float(p) for p in proba_te],
+        "koefisien": ({n: float(c) for n, c in zip(FITUR_NUMERIK + FITUR_BINER, mdl.coef_[0])}
+                      if hasattr(mdl, "coef_") else None),
+    }, OUT)
+    print("Model disimpan ke", OUT.relative_to(BASE))
+
+
+if __name__ == "__main__":
+    main()
+(Untuk akses streamlite)
+
+
+
+
+
+
+%%writefile app.py
+"""Aplikasi Streamlit Kasus 8: prediksi kelompok kasus pada studi infertilitas."""
+from pathlib import Path
+
+import joblib
+import pandas as pd
+import streamlit as st
+
+import fitur  # noqa: F401  (agar joblib dapat memuat FunctionTransformer)
+
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "infert_model.joblib"
+
+st.set_page_config(page_title="Prediksi Studi Infertilitas", page_icon="🩺", layout="centered")
+
+
+@st.cache_resource
+def muat_model():
+    return joblib.load(MODEL_PATH)
+
+
+if not MODEL_PATH.exists():
+    st.error("Model belum ada. Jalankan `python latih.py` terlebih dahulu.")
+    st.stop()
+
+paket = muat_model()
+pipe = paket["pipeline"]
+rng = paket["rentang"]
+ambang = paket["metrik_test"]["ambang"]
+
+st.title("🩺 Prediksi Kelompok Kasus")
+st.subheader("Studi kasus-kontrol infertilitas")
+st.info(
+    "**Cara pakai:** isi lima data di tab *Prediksi*, lalu tekan **Hitung prediksi**. "
+    "Aplikasi menampilkan prediksi (Kasus/Kontrol) beserta probabilitasnya.\n\n"
+    "Aplikasi ini untuk **pembelajaran**, bukan alat diagnosis medis."
+)
+
+tab_pred, tab_metrik, tab_info = st.tabs(["🔮 Prediksi", "📊 Metrik evaluasi", "ℹ️ Tentang model"])
+
+# ---------------------------------------------------------------- PREDIKSI
+with tab_pred:
+    with st.form("form_prediksi"):
+        st.markdown("#### Data perempuan yang diperiksa")
+        c1, c2 = st.columns(2)
+        with c1:
+            education = st.selectbox("Lama pendidikan", paket["opsi_education"], index=1,
+                                     help="0-5 tahun, 6-11 tahun, atau 12 tahun ke atas")
+            age = st.number_input("Usia (tahun)", min_value=15, max_value=60, value=30)
+            parity = st.number_input("Parity (jumlah kehamilan yang dilahirkan)",
+                                     min_value=0, max_value=10, value=2)
+        with c2:
+            induced = st.number_input("Aborsi induksi (kali)", min_value=0, max_value=10, value=0,
+                                      help="Jumlah kehamilan yang diakhiri dengan tindakan medis")
+            spontaneous = st.number_input("Keguguran spontan (kali)", min_value=0, max_value=10, value=0,
+                                          help="Jumlah kehamilan yang berakhir keguguran tanpa tindakan")
+        kirim = st.form_submit_button("Hitung prediksi", type="primary")
+
+    if kirim:
+        mentah = pd.DataFrame([{"education": education, "age": age, "parity": parity,
+                                "induced": induced, "spontaneous": spontaneous}])[paket["kolom_input"]]
+
+        for kol, (lo, hi) in rng.items():
+            if not lo <= mentah.loc[0, kol] <= hi:
+                st.warning(f"Nilai **{kol}** ({mentah.loc[0, kol]}) di luar rentang data latih "
+                           f"({lo}–{hi}); hasil kurang dapat diandalkan.")
+
+        proba = pipe.predict_proba(mentah)[0]          # [P(kontrol), P(kasus)]
+        kelas = int(proba[1] >= ambang)
+
+        st.markdown("### Hasil prediksi")
+        if kelas == 1:
+            st.warning(f"**Prediksi: KASUS** — model memperkirakan peluang kelompok kasus "
+                       f"sebesar **{proba[1]:.1%}**.")
+        else:
+            st.success(f"**Prediksi: KONTROL** — model memperkirakan peluang kelompok kasus "
+                       f"hanya **{proba[1]:.1%}**.")
+
+        m1, m2 = st.columns(2)
+        m1.metric("Probabilitas Kasus", f"{proba[1]:.1%}")
+        m2.metric("Probabilitas Kontrol", f"{proba[0]:.1%}")
+        st.progress(float(proba[1]), text=f"Peluang kasus: {proba[1]:.1%} (ambang keputusan {ambang:.0%})")
+
+        st.markdown("#### Bagaimana jika jumlah keguguran spontan berbeda?")
+        st.caption("Data lain tetap sama; hanya keguguran spontan yang diubah.")
+        skenario = []
+        for s in range(rng["spontaneous"][0], rng["spontaneous"][1] + 1):
+            x = mentah.copy(); x["spontaneous"] = s
+            skenario.append({"Keguguran spontan": s,
+                             "Peluang kasus": f"{pipe.predict_proba(x)[0][1]:.1%}"})
+        st.table(pd.DataFrame(skenario).set_index("Keguguran spontan"))
+
+        with st.expander("Lihat fitur turunan yang dihitung otomatis"):
+            st.dataframe(fitur.tambah_fitur(mentah))
+
+# ----------------------------------------------------------------- METRIK
+with tab_metrik:
+    m = paket["metrik_test"]
+    st.markdown("#### Hasil pada data uji (dievaluasi satu kali)")
+    a, b, c = st.columns(3)
+    a.metric("ROC-AUC", f"{m['roc_auc']:.3f}")
+    b.metric("PR-AUC", f"{m['pr_auc']:.3f}")
+    c.metric("Akurasi", f"{m['accuracy']:.3f}")
+    d, e, f = st.columns(3)
+    d.metric("Recall (Kasus)", f"{m['recall']:.3f}")
+    e.metric("Precision (Kasus)", f"{m['precision']:.3f}")
+    f.metric("F1 (Kasus)", f"{m['f1']:.3f}")
+
+    st.markdown("**Arti metrik**")
+    st.markdown(
+        "- **ROC-AUC**: kemampuan membedakan kasus dari kontrol (0,5 = tebakan acak, 1 = sempurna).\n"
+        "- **PR-AUC**: ringkasan precision-recall; lebih peka pada kelas kasus yang lebih sedikit.\n"
+        "- **Recall**: dari semua kasus sebenarnya, berapa yang berhasil terdeteksi.\n"
+        "- **Precision**: dari semua yang diprediksi kasus, berapa yang benar.\n"
+        "- **F1**: rata-rata harmonik precision dan recall.\n"
+        "- **Akurasi**: hanya pelengkap, karena kelas tidak seimbang."
+    )
+
+    tn, fp = m["confusion_matrix"][0]
+    fn, tp = m["confusion_matrix"][1]
+    st.markdown("#### Confusion matrix")
+    st.dataframe(pd.DataFrame([[tn, fp], [fn, tp]],
+                              index=["Aktual: Kontrol", "Aktual: Kasus"],
+                              columns=["Prediksi: Kontrol", "Prediksi: Kasus"]))
+    st.caption(f"Dari {tp + fn} kasus sebenarnya, {tp} terdeteksi dan {fn} terlewat. "
+               f"Dari {tn + fp} kontrol sebenarnya, {fp} salah diprediksi sebagai kasus.")
+
+    st.markdown("#### Perbandingan model (cross-validation di data latih)")
+    st.dataframe(pd.DataFrame(paket["tabel_cv"]).round(3).set_index("model"))
+    st.caption(f"Model terpilih: **{paket['model_terpilih']}**. Data latih {paket['ukuran']['train']} baris, "
+               f"data uji {paket['ukuran']['test']} baris. Data uji kecil, sehingga angka dapat berfluktuasi; "
+               "angka cross-validation lebih stabil.")
+
+# ------------------------------------------------------------------ INFO
+with tab_info:
+    st.markdown("#### Tentang model")
+    st.markdown(
+        f"- **Algoritma terpilih:** {paket['model_terpilih']} (dalam pipeline scikit-learn)\n"
+        "- **Target:** `case` (1 = kasus, 0 = kontrol)\n"
+        "- **Input mentah:** pendidikan, usia, parity, aborsi induksi, keguguran spontan\n"
+        "- **Fitur turunan otomatis:** total kehilangan kehamilan, total kehamilan, "
+        "indikator pernah keguguran spontan, indikator pernah aborsi induksi, "
+        "dan pendidikan dalam bentuk ordinal\n"
+        "- **Kolom dibuang:** `stratum` dan `pooled.stratum` (nomor kelompok pencocokan dari desain "
+        "studi, tidak ada pada data baru)"
+    )
+    st.markdown("#### Keterbatasan")
+    st.markdown(
+        "- Studi kasus-kontrol hanya menunjukkan **asosiasi**, bukan sebab-akibat.\n"
+        "- Usia, parity, dan pendidikan dicocokkan oleh desain studi, sehingga sinyal utama "
+        "berasal dari riwayat keguguran spontan.\n"
+        "- Data hanya 248 baris; hasil tidak boleh dipakai untuk keputusan medis."
+    )
+    with st.expander("Ringkasan audit data"):
+        st.json(paket["audit"])
+
+
+import subprocess, time, re, os, urllib.request
+
+# 1) bersihkan proses lama
+subprocess.run("pkill -f streamlit; pkill -f cloudflared", shell=True)
+
+# 2) unduh cloudflared (terowongan stabil, tanpa akun dan tanpa password)
+if not os.path.exists('/content/cloudflared'):
+    subprocess.run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/"
+                   "cloudflared-linux-amd64 -O /content/cloudflared && chmod +x /content/cloudflared",
+                   shell=True, check=True)
+
+# 3) jalankan Streamlit (flag CORS/XSRF dimatikan agar aman di belakang terowongan)
+subprocess.Popen("cd /content/proyek && streamlit run app.py --server.port 8501 --server.headless true "
+                 "--server.enableCORS false --server.enableXsrfProtection false "
+                 "--browser.gatherUsageStats false > /content/log.txt 2>&1", shell=True)
+siap = False
+for _ in range(40):
+    time.sleep(1)
+    try:
+        siap = urllib.request.urlopen('http://localhost:8501/_stcore/health').read().decode() == 'ok'
+        if siap: break
+    except Exception:
+        pass
+print('Streamlit siap:', siap)
+if not siap:
+    print(open('/content/log.txt').read()[-1500:])
+
+# 4) buat tautan publik
+subprocess.Popen("/content/cloudflared tunnel --url http://localhost:8501 > /content/cf.log 2>&1", shell=True)
+tautan = None
+for _ in range(40):
+    time.sleep(1)
+    m = re.search(r'https://[-a-z0-9]+\.trycloudflare\.com', open('/content/cf.log').read())
+    if m:
+        tautan = m.group(0); break
+
+# 5) pastikan tautan benar-benar bisa dibuka dari luar sebelum ditampilkan
+aktif = False
+if tautan:
+    for _ in range(30):
+        try:
+            aktif = urllib.request.urlopen(tautan + '/_stcore/health', timeout=5).read().decode() == 'ok'
+            if aktif: break
+        except Exception:
+            pass
+        time.sleep(2)
+print('\nTautan aktif:', aktif)
+print('BUKA APLIKASI DI:', tautan or 'tautan belum muncul, lihat /content/cf.log')
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from sklearn.metrics import roc_curve, precision_recall_curve
+
+# Ambil data evaluasi dari paket model
+y_test = np.array(paket["y_test"])
+proba_test = np.array(paket["proba_test"])
+cm = np.array(paket["metrik_test"]["confusion_matrix"])
+
+# Setup plot dengan 3 subplot
+fig, ax = plt.subplots(1, 3, figsize=(18, 5))
+
+# 1) Heatmap Confusion Matrix
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax[0],
+            xticklabels=['Prediksi: Kontrol', 'Prediksi: Kasus'],
+            yticklabels=['Aktual: Kontrol', 'Aktual: Kasus'])
+ax[0].set_title("Confusion Matrix")
+ax[0].set_ylabel("Aktual")
+ax[0].set_xlabel("Prediksi")
+
+# 2) Kurva ROC
+fpr, tpr, _ = roc_curve(y_test, proba_test)
+ax[1].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC Curve (AUC = {paket["metrik_test"]["roc_auc"]:.3f})')
+ax[1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+ax[1].set_xlim([0.0, 1.0])
+ax[1].set_ylim([0.0, 1.05])
+ax[1].set_xlabel('False Positive Rate')
+ax[1].set_ylabel('True Positive Rate')
+ax[1].set_title('Receiver Operating Characteristic (ROC)')
+ax[1].legend(loc="lower right")
+ax[1].grid(True, linestyle='--', alpha=0.5)
+
+# 3) Kurva Precision-Recall
+precision, recall, _ = precision_recall_curve(y_test, proba_test)
+ax[2].plot(recall, precision, color='green', lw=2, label=f'PR Curve (AP = {paket["metrik_test"]["pr_auc"]:.3f})')
+ax[2].set_xlabel('Recall')
+ax[2].set_ylabel('Precision')
+ax[2].set_title('Precision-Recall Curve')
+ax[2].legend(loc="lower left")
+ax[2].grid(True, linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import GroupShuffleSplit
+
+# Memuat data asli untuk mencocokkan indeks data uji
+DATA_PATH = Path('/content/proyek/dataset/kasus08_infert.csv')
+df_mentah = pd.read_csv(DATA_PATH)
+
+# Membangun ulang indeks split data uji yang sama seperti di latih.py
+y = df_mentah["case"]
+groups = df_mentah["stratum"]
+KOLOM_BUANG = ["case", "stratum", "pooled.stratum"]
+KOLOM_MENTAH = ["education", "age", "parity", "induced", "spontaneous"]
+X = df_mentah.drop(columns=KOLOM_BUANG)[KOLOM_MENTAH]
+
+_, te = next(GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42).split(X, y, groups))
+X_te = df_mentah.iloc[te].copy()
+
+# Ambil probabilitas dan label prediksi
+proba_kasus = np.array(paket["proba_test"])
+ambang = paket["metrik_test"]["ambang"]
+prediksi = (proba_kasus >= ambang).astype(int)
+aktual = np.array(paket["y_test"])
+
+# Satukan ke dalam DataFrame
+tabel_prediksi = X_te.copy()
+tabel_prediksi["Probabilitas Kasus"] = proba_kasus
+tabel_prediksi["Prediksi Model"] = ["Kasus" if p == 1 else "Kontrol" for p in prediksi]
+tabel_prediksi["Aktual"] = ["Kasus" if a == 1 else "Kontrol" for a in aktual]
+
+# Tampilkan 15 data pertama dari tabel hasil prediksi
+display(tabel_prediksi.head(15).round(4))
+
+
+
+
+
+
+
+
+
+
+
